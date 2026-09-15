@@ -336,9 +336,18 @@ fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
     }
     anyhow::bail!(
         "a stale llmman serve daemon is still holding {} after being asked to stop; \
-         stop it manually (e.g. pkill -f 'llmman serve') and retry",
-        bind_addr()
+         stop it manually{} and retry",
+        bind_addr(),
+        manual_stop_hint(identity.pid)
     )
+}
+
+/// The parenthetical in [`stop_stale_daemon`]'s give-up message: the
+/// daemon's own pid, published on `/api/version` for exactly this. The
+/// earlier `pkill -f 'llmman serve'` matched whole command lines, taking
+/// down the shell that ran it. No pid, no suggestion.
+fn manual_stop_hint(pid: Option<u32>) -> String {
+    pid.map_or_else(String::new, |pid| format!(" (kill {pid})"))
 }
 
 /// Polls for the daemon port to free up, every 100ms for up to 5s.
@@ -1820,5 +1829,14 @@ mod tests {
             r#"{"message":"model 'docker.io/ai/m' not found"}"#,
             m
         ));
+    }
+
+    /// Why a pid rather than a pattern: see [`manual_stop_hint`].
+    #[test]
+    fn manual_stop_hint_names_the_pid_rather_than_a_pkill_pattern() {
+        assert_eq!(manual_stop_hint(Some(931970)), " (kill 931970)");
+        assert!(!manual_stop_hint(Some(931970)).contains("pkill"));
+        // A daemon too old to report a pid gets no suggestion at all.
+        assert_eq!(manual_stop_hint(None), "");
     }
 }
