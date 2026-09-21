@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `codex`, `grok`, `qwen`, `hermes`,
+//! (`claude`, `agy`, `opencode`, `pi`, `codex`, `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
@@ -614,6 +614,7 @@ fn run_launch(
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"))
         .env("GROK_HOME", home.join(".grok"))
+        .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
         // auto-approving an agent's writes is the user's call.
@@ -928,6 +929,26 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+#[test]
+fn launch_pi_with_model() {
+    eprintln!("[test] launch_pi_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_pi_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("pi") {
+        eprintln!("skipping: pi not on PATH — npm install -g @earendil-works/pi-coding-agent");
+        return;
+    }
+
+    // `-p <prompt>`: pi's own print-and-exit mode. `run_launch` gives it a
+    // fresh HOME and PI_CODING_AGENT_DIR, so this exercises writing
+    // models.json and settings.json from nothing as well as the request.
+    launch_and_assert("pi", &["-p", PROMPT]);
 }
 
 #[test]
