@@ -275,7 +275,7 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, Grok Build,
+(Claude Code, OpenCode, Codex, Pi, Aider, Qwen Code, Gemini CLI, Grok Build,
 AGY, DeepSeek Harness, ...) and whether each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine. `dsh` runs under `npx` when it isn't installed globally. Any extra

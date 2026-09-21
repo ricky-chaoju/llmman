@@ -462,6 +462,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "codex",
     },
     Integration {
+        name: "pi",
+        description: "Pi coding agent",
+        binary: "pi",
+    },
+    Integration {
         name: "cline",
         description: "Cline",
         binary: "cline",
@@ -615,6 +620,14 @@ fn launch(
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
+        "pi" => launch_pi(
+            model,
+            api_key,
+            thinking,
+            vision,
+            context_length,
+            extra_args,
+        ),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -850,6 +863,232 @@ fn opencode_config(
         model: format!("ollama/{model}"),
     };
     serde_json::to_string(&config).expect("opencode config serializes")
+}
+
+/// pi: register llmman as an OpenAI-compatible provider in `models.json`,
+/// point `settings.json` at it, and select that model for this launch.
+///
+/// The key travels on argv rather than in the config: pi documents
+/// `--api-key` alongside `/login` and a provider `apiKey` (see its
+/// `models.md`), and pi is not in [`PROVIDER_NEEDS_DAEMON_KEY`], so a
+/// `--provider` credential is never written to disk. The stored `apiKey`
+/// stays the literal placeholder the codex and hermes configs also write,
+/// which keeps a plain `pi` run outside `llmman launch` usable — an
+/// environment reference (`"$VAR"`, which pi does interpolate) would be
+/// "unresolved" there and take the provider down with it.
+fn launch_pi(
+    model: &str,
+    api_key: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let bin = find_on_path("pi").ok_or_else(|| anyhow::anyhow!("pi is not installed"))?;
+
+    let effective_model = if model.is_empty() { "default" } else { model };
+    write_pi_config(effective_model, thinking, vision, context_length)?;
+
+    let mut args = vec![
+        "--model".to_string(),
+        format!("{PI_PROVIDER}/{effective_model}"),
+        "--api-key".to_string(),
+        api_key.to_string(),
+    ];
+    args.extend_from_slice(extra_args);
+    exec_with_env(&bin, &args, &[])
+}
+
+/// The provider key llmman owns in pi's `models.json`.
+const PI_PROVIDER: &str = "llmman";
+
+/// Marks the model entries llmman wrote, so a rewrite rebuilds only its
+/// own and leaves anything the user added under this provider alone.
+const PI_MARKER: &str = "_llmman";
+
+/// pi's config directory: `PI_CODING_AGENT_DIR` when set, else
+/// `~/.pi/agent`.
+///
+/// `HOME`/`USERPROFILE` win over the platform's known-folder lookup
+/// because pi is node and `os.homedir()` reads those first, so a test or
+/// sandbox that sets them must send both halves to the same place. A
+/// leading `~` in the override is expanded on the way in: a shell expands
+/// one before the variable is ever set, so a `~` that survives into it
+/// was quoted, and the home directory is what it was meant to name.
+/// Whether pi expands one itself is not documented.
+fn pi_agent_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+    {
+        return expand_home(dir.trim());
+    }
+    Ok(node_home()?.join(".pi").join("agent"))
+}
+
+/// `os.homedir()`'s own order: `HOME`, then `USERPROFILE`, then the
+/// platform lookup `dirs` does.
+fn node_home() -> anyhow::Result<PathBuf> {
+    for var in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(var).filter(|h| !h.is_empty()) {
+            return Ok(PathBuf::from(home));
+        }
+    }
+    dirs::home_dir().context("no home directory")
+}
+
+/// `path` with a leading `~` replaced by [`node_home`].
+fn expand_home(path: &str) -> anyhow::Result<PathBuf> {
+    match path.strip_prefix('~') {
+        Some(rest) => Ok(node_home()?.join(rest.trim_start_matches(['/', '\\']))),
+        None => Ok(PathBuf::from(path)),
+    }
+}
+
+/// Writes pi's `models.json` provider and points `settings.json` at it.
+///
+/// Each step mirrors its counterpart in [`write_qwen_settings_at`] rather
+/// than restating why — the comment tolerance, the `.bak`, the
+/// skip-when-unchanged and the atomic write are all that function's.
+fn write_pi_config(
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+) -> anyhow::Result<()> {
+    let dir = pi_agent_dir()?;
+    let entry = pi_model_entry(model, thinking, vision, context_length);
+    write_pi_json(&dir.join("models.json"), |existing| {
+        pi_models_merged(existing, &daemon::server(), &entry)
+    })?;
+    write_pi_json(&dir.join("settings.json"), |existing| {
+        pi_settings_merged(existing, model)
+    })
+}
+
+/// Reads `path`, hands the parsed object to `merge`, and writes the result
+/// back. See [`write_qwen_settings_at`], which this follows step for step;
+/// the one addition is the BOM, which pi strips (`stripBom` before
+/// `JSON.parse`) and `serde_json` rejects.
+fn write_pi_json(
+    path: &Path,
+    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> anyhow::Result<()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let existing = match raw
+        .as_deref()
+        .map(|r| r.trim_start_matches('\u{feff}').trim())
+    {
+        None | Some("") => serde_json::json!({}),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(&strip_json_comments(text)) {
+            Ok(value) if value.is_object() => value,
+            _ => {
+                eprintln!(
+                    "[llmman] pi: {} is not a JSON object; leaving it alone",
+                    path.display()
+                );
+                return Ok(());
+            }
+        },
+    };
+    let merged = merge(&existing);
+    if merged == existing {
+        return Ok(());
+    }
+    let dir = path.parent().context("pi config path has no directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    if let Some(raw) = &raw {
+        let bak = path.with_extension("json.bak");
+        if !bak.exists() || strip_json_comments(raw) != *raw {
+            std::fs::copy(path, &bak)
+                .with_context(|| format!("back up {} to {}", path.display(), bak.display()))?;
+        }
+    }
+    let mut out = serde_json::to_string_pretty(&merged)?;
+    out.push('\n');
+    crate::fsutil::write_atomic(path, out.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// The model pi is told about: what it can take in, whether it thinks,
+/// and how much it can hold. Every example in pi's own `models.md`
+/// declares these, and what it assumes for an entry that omits them is
+/// not written down, so they are stated rather than left to it.
+fn pi_model_entry(
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+) -> serde_json::Value {
+    let input: &[&str] = if vision {
+        &["text", "image"]
+    } else {
+        &["text"]
+    };
+    let mut entry = serde_json::json!({
+        "id": model,
+        "input": input,
+        "reasoning": thinking.is_some_and(|t| t.thinks),
+        PI_MARKER: true,
+    });
+    if let Some(context) = context_length {
+        entry["contextWindow"] = serde_json::json!(context);
+    }
+    entry
+}
+
+/// `existing` with llmman's provider rebuilt around `entry`, keeping every
+/// other provider and every other model under this one — launching a
+/// second model must not drop the first, whoever wrote it. Only the entry
+/// for this same `id` is replaced; [`PI_MARKER`] records which ones came
+/// from here rather than deciding what survives.
+fn pi_models_merged(
+    existing: &serde_json::Value,
+    server: &str,
+    entry: &serde_json::Value,
+) -> serde_json::Value {
+    let mut root = existing.clone();
+    let kept: Vec<serde_json::Value> = root
+        .get("providers")
+        .and_then(|p| p.get(PI_PROVIDER))
+        .and_then(|p| p.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter(|m| m.get("id") != entry.get("id"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut models = kept;
+    models.push(entry.clone());
+    root["providers"][PI_PROVIDER] = serde_json::json!({
+        "baseUrl": format!("{server}/v1"),
+        "api": "openai-completions",
+        // A literal, not a `"$VAR"` reference pi would interpolate: see
+        // launch_pi's own doc comment.
+        "apiKey": "llmman",
+        "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false
+        },
+        "models": models,
+    });
+    root
+}
+
+/// `existing` with pi's startup provider and model pointed at this launch,
+/// leaving every other setting alone.
+fn pi_settings_merged(existing: &serde_json::Value, model: &str) -> serde_json::Value {
+    let mut root = existing.clone();
+    root["defaultProvider"] = serde_json::json!(PI_PROVIDER);
+    root["defaultModel"] = serde_json::json!(model);
+    root
 }
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
@@ -2799,6 +3038,103 @@ mod tests {
 
     /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
     /// and nothing else moves: not a `//` inside a string, not a column.
+    #[test]
+    fn pi_model_entry_declares_what_the_daemon_serves() {
+        let thinks = crate::chat_template::ThinkingControls {
+            thinks: true,
+            enable_thinking: true,
+            efforts: vec!["low", "high"],
+        };
+        let entry = pi_model_entry("qwen3.5:0.8b", Some(&thinks), true, Some(32768));
+        assert_eq!(entry["id"], "qwen3.5:0.8b");
+        assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(entry["reasoning"], true);
+        assert_eq!(entry["contextWindow"], 32768);
+
+        // A text-only model that does not think, and no trained context to
+        // declare: pi keeps its own default rather than being told a guess.
+        let plain = pi_model_entry("smol", None, false, None);
+        assert_eq!(plain["input"], serde_json::json!(["text"]));
+        assert_eq!(plain["reasoning"], false);
+        assert_eq!(plain.get("contextWindow"), None);
+    }
+
+    #[test]
+    fn pi_models_merged_keeps_other_providers_and_hand_added_models() {
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+              "providers": {
+                "other": { "baseUrl": "https://example.invalid/v1" },
+                "llmman": { "models": [
+                  { "id": "mine" },
+                  { "id": "stale", "_llmman": true }
+                ] }
+              }
+            }"#,
+        )
+        .unwrap();
+        let entry = pi_model_entry("qwen3.5:0.8b", None, false, None);
+        let merged = pi_models_merged(&existing, "http://127.0.0.1:17434", &entry);
+
+        assert_eq!(
+            merged["providers"]["other"]["baseUrl"],
+            "https://example.invalid/v1"
+        );
+        assert_eq!(
+            merged["providers"]["llmman"]["baseUrl"],
+            "http://127.0.0.1:17434/v1"
+        );
+        // Literal, never an interpolated reference — see launch_pi.
+        assert_eq!(merged["providers"]["llmman"]["apiKey"], "llmman");
+        let ids: Vec<&str> = merged["providers"]["llmman"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        // Both survive; llmman's own is rebuilt in place, not doubled.
+        assert_eq!(ids, vec!["mine", "stale", "qwen3.5:0.8b"]);
+    }
+
+    /// Launching a second model must not drop the first.
+    #[test]
+    fn pi_models_merged_keeps_a_previously_launched_model() {
+        let first = pi_model_entry("a", None, false, None);
+        let one = pi_models_merged(&serde_json::json!({}), "http://s", &first);
+        let two = pi_models_merged(&one, "http://s", &pi_model_entry("b", None, false, None));
+        let ids: Vec<&str> = two["providers"]["llmman"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn pi_settings_merged_leaves_unrelated_settings_alone() {
+        let existing = serde_json::json!({ "theme": "dark", "defaultModel": "old" });
+        let merged = pi_settings_merged(&existing, "qwen3.5:0.8b");
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["defaultProvider"], "llmman");
+        assert_eq!(merged["defaultModel"], "qwen3.5:0.8b");
+    }
+
+    /// A `~` that survives into the variable means the home directory —
+    /// see [`pi_agent_dir`].
+    #[test]
+    fn expand_home_resolves_a_leading_tilde() {
+        let home = node_home().unwrap();
+        assert_eq!(
+            expand_home("~/.config/pi").unwrap(),
+            home.join(".config/pi")
+        );
+        assert_eq!(
+            expand_home("/tmp/pi").unwrap(),
+            std::path::PathBuf::from("/tmp/pi")
+        );
+    }
+
     #[test]
     fn strip_json_comments_keeps_strings_and_columns() {
         let raw =
