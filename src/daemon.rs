@@ -339,9 +339,10 @@ fn stale_daemon() -> Option<DaemonIdentity> {
 /// The systemd unit managing `pid`, read off its cgroup — `None` when no
 /// unit does.
 ///
-/// A unit's processes sit in a cgroup path whose last segment is the unit
-/// name (`.../user@1000.service/session.slice/sh.brew.llmman.service`);
-/// a process started from a shell sits in a `.scope` instead.
+/// A unit's processes sit in a cgroup path naming the unit
+/// (`.../user@1000.service/session.slice/sh.brew.llmman.service`); a
+/// process started from a shell sits in a `.scope` instead. See
+/// [`unit_from_cgroup`] for which segment of the path that is.
 ///
 /// A unit this process is itself in does not count. `detach` changes the
 /// process group and not the cgroup, so a daemon llmman spawned from
@@ -370,13 +371,20 @@ fn unit_of(pid: u32) -> Option<String> {
     unit_from_cgroup(&cgroup)
 }
 
-/// The unit name in a `/proc/<pid>/cgroup` body — see [`service_unit`].
+/// The innermost unit in a `/proc/<pid>/cgroup` body, not the last
+/// segment: `DelegateSubgroup=` runs a unit's own main process a level
+/// deeper (`.../foo.service/supervisor`), where reading the leaf finds no
+/// unit and supersedes a daemon its manager owns. Stopping at a `.scope`
+/// keeps a daemon started from a shell from reporting the
+/// `user@<uid>.service` above it — see [`service_unit`].
 fn unit_from_cgroup(cgroup: &str) -> Option<String> {
     cgroup
         .lines()
-        .filter_map(|line| line.rsplit_once('/'))
-        .map(|(_, last)| last)
-        .find(|last| last.ends_with(".service"))
+        .filter_map(|line| {
+            line.rsplit('/')
+                .find(|segment| segment.ends_with(".service") || segment.ends_with(".scope"))
+        })
+        .find(|unit| unit.ends_with(".service"))
         .map(str::to_string)
 }
 
@@ -2559,9 +2567,9 @@ mod tests {
         }
     }
 
-    /// Real `/proc/<pid>/cgroup` bodies: a unit's processes end in the
-    /// unit name, a shell's in a `.scope` — see [`service_unit`] for why
-    /// the difference decides whether llmman may stop the daemon.
+    /// Real `/proc/<pid>/cgroup` bodies: a unit's processes name the
+    /// unit, a shell's a `.scope` — see [`service_unit`] for why the
+    /// difference decides whether llmman may stop the daemon.
     #[test]
     fn unit_from_cgroup_names_the_unit_and_only_a_unit() {
         assert_eq!(
@@ -2587,6 +2595,16 @@ mod tests {
             )
             .as_deref(),
             Some("sh.brew.llmman.service")
+        );
+        // `Delegate=yes` with `DelegateSubgroup=supervisor` puts the
+        // unit's own main process below the unit; body captured from
+        // systemd 255.
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/dlg.service/supervisor\n"
+            )
+            .as_deref(),
+            Some("dlg.service")
         );
         assert_eq!(unit_from_cgroup(""), None);
         // The user manager itself is a `.service`, but a daemon under it
